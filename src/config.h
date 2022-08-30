@@ -1,0 +1,5 @@
+#define STATUS_PIN 2
+#define CONTROL_PIN 27
+
+#define HP_POLL_TIME_MS 10000
+#define HP_POLL_DELAY 30000
