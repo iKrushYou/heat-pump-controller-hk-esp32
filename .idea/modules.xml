@@ -3,6 +3,7 @@
   <component name="ProjectModuleManager">
     <modules>
       <module fileurl="file://$PROJECT_DIR$/.idea/heat-pump-controller-hk-esp32.iml" filepath="$PROJECT_DIR$/.idea/heat-pump-controller-hk-esp32.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/heat-pump-controller-hk-esp322.iml" filepath="$PROJECT_DIR$/.idea/heat-pump-controller-hk-esp322.iml" />
     </modules>
   </component>
 </project>
