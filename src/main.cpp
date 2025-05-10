@@ -8,9 +8,9 @@
 
 HeatPump heatPump;
 
-boolean isUpdating = false;
+// boolean isUpdating = false;
 // nextUpdateTime tracks a timestamp for when the homekit update cycle should run
-unsigned long nextUpdateTime = millis();
+// unsigned long nextUpdateTime = millis();
 // nextPollTime tracks a timestamp for when the next heatpump settings poll should run
 unsigned long nextPollTime = millis();
 unsigned long nextTempPollTime = millis();
@@ -78,7 +78,9 @@ int getCurrentHeatingCoolingState(const String &powerSetting, const String &mode
 }
 
 float getTargetTemperature() {
-    return targetTemperature->getNewVal<float>();
+    const auto rawTemp = targetTemperature->getNewVal<float>();
+    // Round to nearest 0.5
+    return round(rawTemp * 2) / 2.0f;
 }
 
 int getTargetHeatingCoolingState(const String &powerSetting, const String &modeSetting) {
@@ -90,14 +92,14 @@ int getTargetHeatingCoolingState(const String &powerSetting, const String &modeS
     return 0;
 }
 
-const char* getPowerSetting() {
+const char *getPowerSetting() {
     const int targetHeatingCoolingStateVal = targetHeatingCoolingState->getNewVal();
 
     if (targetHeatingCoolingStateVal == 0) return "OFF";
     return "ON";
 }
 
-const char* getModeSetting() {
+const char *getModeSetting() {
     const int targetHeatingCoolingStateVal = targetHeatingCoolingState->getNewVal();
 
     if (targetHeatingCoolingStateVal == 1) return "HEAT";
@@ -110,7 +112,7 @@ const char* getModeSetting() {
  *
  * @return HP fan speed
  */
-const char* getFanSpeed() {
+const char *getFanSpeed() {
     const int fanRotationSpeedVal = fanRotationSpeed->getNewVal();
 
     if (fanRotationSpeedVal == 0) return "QUIET";
@@ -149,7 +151,7 @@ int getSwingMode(const String &vaneSetting) {
     return 0;
 }
 
-const char* getVaneSetting() {
+const char *getVaneSetting() {
     const int swingModeVal = swingMode->getNewVal();
     const int targetTiltAngleVal = targetTiltAngle->getNewVal();
 
@@ -216,13 +218,35 @@ void delayHPPolling() {
     nextPollTime = millis() + HP_POLL_DELAY;
 }
 
-void queueUpdate() {
-    isUpdating = true;
+struct DeviceState {
+    boolean isUpdating;
+    boolean isVerifying;
+    const char *power;
+    const char *mode;
+    float targetTemperature;
+    const char *fanSpeed;
+    const char *vane;
+    unsigned long nextUpdateTime;
+};
 
-    // sets the next update time into the future to provide a buffer for any additional state changes
-    nextUpdateTime = millis() + HK_UPDATE_DEBOUNCE;
+DeviceState deviceState = {};
 
+void handleUpdate() {
+    LOG0("handling update\n");
     delayHPPolling();
+
+    // pin fan speed to set value
+    fanRotationSpeed->setVal(getFanRotationSpeed(getFanSpeed()));
+
+    // update device state from HK values
+    deviceState.isUpdating = true;
+    deviceState.isVerifying = false;
+    deviceState.power = getPowerSetting();
+    deviceState.mode = getModeSetting();
+    deviceState.targetTemperature = getTargetTemperature();
+    deviceState.fanSpeed = getFanSpeed();
+    deviceState.vane = getVaneSetting();
+    deviceState.nextUpdateTime = millis() + HK_UPDATE_DEBOUNCE;
 }
 
 struct ThermostatController final : Service::Thermostat {
@@ -238,7 +262,7 @@ struct ThermostatController final : Service::Thermostat {
     }
 
     boolean update() override {
-        queueUpdate();
+        handleUpdate();
 
         return true;
     }
@@ -265,9 +289,8 @@ struct ThermostatController final : Service::Thermostat {
             }
         }
 
-        // if update marked as in progress, and it is time to update
-        if (isUpdating && nextUpdateTime < millis()) {
-            // delay polling so there are no conflicts
+        if (deviceState.isUpdating && deviceState.nextUpdateTime < millis()) {
+            LOG0("updating\n");
             delayHPPolling();
 
             // read current state from heat pump
@@ -276,24 +299,13 @@ struct ThermostatController final : Service::Thermostat {
             heatpumpSettings settings = heatPump.getSettings();
 
             LOG0("-- start HK Update--\n");
-
             printHKValues();
 
-            // start thermostat update
-            settings.power = getPowerSetting();
-            settings.mode = getModeSetting();
-            settings.temperature = getTargetTemperature();
-            // end thermostat update
-
-            // start fan update
-
-            settings.fan = getFanSpeed();
-            fanRotationSpeed->setVal(getFanRotationSpeed(getFanSpeed()));
-            // end fan update
-
-            // start slat update
-            settings.vane = getVaneSetting();
-            // end slat update
+            settings.power = deviceState.power;
+            settings.mode = deviceState.mode;
+            settings.temperature = deviceState.targetTemperature;
+            settings.fan = deviceState.fanSpeed;
+            settings.vane = deviceState.vane;
 
             LOG0("new HP Settings:\n");
             printHPValues(settings);
@@ -301,12 +313,47 @@ struct ThermostatController final : Service::Thermostat {
             heatPump.setSettings(settings);
             heatPump.update();
 
-            isUpdating = false;
+            deviceState.isUpdating = false;
+            deviceState.isVerifying = true;
+            deviceState.nextUpdateTime = millis() + 1000;
             LOG0("-- end HK update --\n");
         }
 
+        if (deviceState.isVerifying && deviceState.nextUpdateTime < millis()) {
+            LOG0("verifying\n");
+            heatPump.sync();
+            const heatpumpSettings settings = heatPump.getSettings();
+
+            LOG0("Comparing settings vs deviceState:\n");
+            LOG0("  power: '%s' vs '%s' - %s\n", settings.power, deviceState.power,
+                 (strcmp(settings.power, deviceState.power) == 0 ? "match" : "MISMATCH"));
+            LOG0("  mode: '%s' vs '%s' - %s\n", settings.mode, deviceState.mode,
+                 (strcmp(settings.mode, deviceState.mode) == 0 ? "match" : "MISMATCH"));
+            LOG0("  temperature: %.1f vs %.1f - %s\n", settings.temperature, deviceState.targetTemperature,
+                 (settings.temperature == deviceState.targetTemperature ? "match" : "MISMATCH"));
+            LOG0("  fan: '%s' vs '%s' - %s\n", settings.fan, deviceState.fanSpeed,
+                 (strcmp(settings.fan, deviceState.fanSpeed) == 0 ? "match" : "MISMATCH"));
+            LOG0("  vane: '%s' vs '%s' - %s\n", settings.vane, deviceState.vane,
+                 (strcmp(settings.vane, deviceState.vane) == 0 ? "match" : "MISMATCH"));
+
+            const boolean configsMatch =
+                    strcmp(settings.power, deviceState.power) == 0 &&
+                    strcmp(settings.mode, deviceState.mode) == 0 &&
+                    settings.temperature == deviceState.targetTemperature &&
+                    strcmp(settings.fan, deviceState.fanSpeed) == 0 &&
+                    strcmp(settings.vane, deviceState.vane) == 0;
+
+
+            deviceState.isVerifying = false;
+            if (!configsMatch) {
+                LOG0("configs don't match, updating again\n");
+                deviceState.isUpdating = true;
+                deviceState.nextUpdateTime = millis() + 1000;
+            }
+        }
+
         // if update not currently in progress, and it is time to poll
-        if (!isUpdating && nextPollTime < millis()) {
+        if (!deviceState.isUpdating && !deviceState.isVerifying && nextPollTime < millis()) {
             LOG0("-- start heatpump update--\n");
             delayHPPolling();
 
@@ -335,12 +382,9 @@ struct FanController final : Service::Fan {
     }
 
     boolean update() override {
-        queueUpdate();
+        handleUpdate();
 
         return true;
-    }
-
-    void loop() override {
     }
 };
 
@@ -354,7 +398,7 @@ struct SlatController final : Service::Slat {
     }
 
     boolean update() override {
-        queueUpdate();
+        handleUpdate();
 
         return true;
     }
@@ -395,7 +439,7 @@ void setup() {
     new Characteristic::Version("1.1.0");
 
     if (!heatPump.connect(&Serial2)) {
-        Serial.printf("failed to connect to the heat pump");
+        LOG0("failed to connect to the heat pump\n");
     }
     heatPump.enableExternalUpdate();
     // heatPump.setSettings({ //set some default settings
